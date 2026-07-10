@@ -31,15 +31,21 @@ jobs:
           if ! id proxyuser >/dev/null 2>&1; then
             sudo useradd -m -s /bin/bash proxyuser
           fi
-          echo 'proxyuser:proxy123' | sudo chpasswd
           sudo mkdir -p /home/proxyuser/.ssh
-          if [ -n '${{ inputs.ssh_public_key }}' ]; then
-            printf '%s\n' '${{ inputs.ssh_public_key }}' | sudo tee /home/proxyuser/.ssh/authorized_keys >/dev/null
+          SSH_PUBLIC_KEY='${{ secrets.PROXY_SSH_PUBLIC_KEY }}'
+          if [ -z "$SSH_PUBLIC_KEY" ]; then
+            SSH_PUBLIC_KEY='${{ inputs.ssh_public_key }}'
           fi
+          if [ -z "$SSH_PUBLIC_KEY" ]; then
+            echo "SSH public key is required"
+            exit 1
+          fi
+          printf '%s\n' "$SSH_PUBLIC_KEY" | sudo tee /home/proxyuser/.ssh/authorized_keys >/dev/null
           sudo chown -R proxyuser:proxyuser /home/proxyuser/.ssh
           sudo chmod 700 /home/proxyuser/.ssh
-          sudo chmod 600 /home/proxyuser/.ssh/authorized_keys 2>/dev/null || true
-          sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo chmod 600 /home/proxyuser/.ssh/authorized_keys
+          sudo passwd -l proxyuser || true
+          sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config
           sudo sed -i 's/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
           sudo /usr/sbin/sshd -t
           sudo /usr/sbin/sshd
@@ -49,13 +55,30 @@ jobs:
         run: |
           set -euo pipefail
           nohup cloudflared tunnel --url ssh://localhost:22 --no-autoupdate > cloudflared.log 2>&1 &
-          for i in {1..30}; do
-            if grep -Eo 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' cloudflared.log; then
+          mkdir -p tunnel-info
+          TUNNEL_URL=""
+          for i in {1..60}; do
+            TUNNEL_URL="$(grep -Eo 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' cloudflared.log | tail -n 1 || true)"
+            if [ -n "$TUNNEL_URL" ]; then
               break
             fi
             sleep 2
           done
+          if [ -z "$TUNNEL_URL" ]; then
+            cat cloudflared.log
+            exit 1
+          fi
+          TUNNEL_HOST="${TUNNEL_URL#https://}"
+          printf '%s\n' "$TUNNEL_HOST" > tunnel-info/host.txt
+          printf '%s\n' "$TUNNEL_URL" > tunnel-info/url.txt
+          printf 'Cloudflare tunnel: %s\n' "$TUNNEL_URL"
           cat cloudflared.log
+
+      - name: Upload tunnel info
+        uses: actions/upload-artifact@v4
+        with:
+          name: tunnel-info
+          path: tunnel-info/
 
       - name: Keep proxy alive
         shell: bash
