@@ -1,0 +1,62 @@
+name: Cloudflare Tunnel Proxy
+
+on:
+  workflow_dispatch:
+    inputs:
+      ssh_public_key:
+        description: Public SSH key allowed for proxyuser
+        required: false
+        type: string
+
+jobs:
+  proxy:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360
+    steps:
+      - name: Install cloudflared
+        shell: bash
+        run: |
+          set -euo pipefail
+          curl -fsSL -o /tmp/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          sudo install -m 0755 /tmp/cloudflared /usr/local/bin/cloudflared
+          cloudflared --version
+
+      - name: Configure SSH server
+        shell: bash
+        run: |
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y openssh-server
+          sudo mkdir -p /run/sshd
+          if ! id proxyuser >/dev/null 2>&1; then
+            sudo useradd -m -s /bin/bash proxyuser
+          fi
+          echo 'proxyuser:proxy123' | sudo chpasswd
+          sudo mkdir -p /home/proxyuser/.ssh
+          if [ -n '${{ inputs.ssh_public_key }}' ]; then
+            printf '%s\n' '${{ inputs.ssh_public_key }}' | sudo tee /home/proxyuser/.ssh/authorized_keys >/dev/null
+          fi
+          sudo chown -R proxyuser:proxyuser /home/proxyuser/.ssh
+          sudo chmod 700 /home/proxyuser/.ssh
+          sudo chmod 600 /home/proxyuser/.ssh/authorized_keys 2>/dev/null || true
+          sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication yes/' /etc/ssh/sshd_config
+          sudo sed -i 's/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+          sudo /usr/sbin/sshd -t
+          sudo /usr/sbin/sshd
+
+      - name: Start Cloudflare quick tunnel
+        shell: bash
+        run: |
+          set -euo pipefail
+          nohup cloudflared tunnel --url ssh://localhost:22 --no-autoupdate > cloudflared.log 2>&1 &
+          for i in {1..30}; do
+            if grep -Eo 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' cloudflared.log; then
+              break
+            fi
+            sleep 2
+          done
+          cat cloudflared.log
+
+      - name: Keep proxy alive
+        shell: bash
+        run: sleep 21600
