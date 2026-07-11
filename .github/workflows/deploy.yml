@@ -1,4 +1,4 @@
-# cloudflare-proxy-managed-version: 2
+# cloudflare-proxy-managed-version: 3
 name: Cloudflare Tunnel Proxy
 
 on:
@@ -73,7 +73,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          nohup env RUNNER_TRACKING_ID="" cloudflared tunnel --url ssh://localhost:22 --no-autoupdate > cloudflared.log 2>&1 &
+          nohup cloudflared tunnel --url ssh://localhost:22 --no-autoupdate > cloudflared.log 2>&1 &
           echo $! > cloudflared.pid
           mkdir -p tunnel-info
           TUNNEL_URL=""
@@ -105,8 +105,7 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          CLOUDFLARED_PID="$(cat cloudflared.pid)"
-          while kill -0 "$CLOUDFLARED_PID" 2>/dev/null && sudo pgrep -x sshd >/dev/null; do
+          while pgrep -f 'cloudflared tunnel --url ssh://localhost:22' >/dev/null && timeout 2 bash -c '</dev/tcp/127.0.0.1/22' 2>/dev/null; do
             sleep 10
           done
           echo "cloudflared or sshd exited unexpectedly"
