@@ -1,3 +1,4 @@
+# cloudflare-proxy-managed-version: 2
 name: Cloudflare Tunnel Proxy
 
 on:
@@ -7,6 +8,9 @@ on:
         description: Public SSH key allowed for proxyuser
         required: false
         type: string
+
+permissions:
+  contents: read
 
 jobs:
   proxy:
@@ -23,6 +27,9 @@ jobs:
 
       - name: Configure SSH server
         shell: bash
+        env:
+          SSH_PUBLIC_KEY_SECRET: ${{ secrets.PROXY_SSH_PUBLIC_KEY }}
+          SSH_PUBLIC_KEY_INPUT: ${{ inputs.ssh_public_key }}
         run: |
           set -euo pipefail
           sudo apt-get update
@@ -32,12 +39,16 @@ jobs:
             sudo useradd -m -s /bin/bash proxyuser
           fi
           sudo mkdir -p /home/proxyuser/.ssh
-          SSH_PUBLIC_KEY='${{ secrets.PROXY_SSH_PUBLIC_KEY }}'
+          SSH_PUBLIC_KEY="$SSH_PUBLIC_KEY_SECRET"
           if [ -z "$SSH_PUBLIC_KEY" ]; then
-            SSH_PUBLIC_KEY='${{ inputs.ssh_public_key }}'
+            SSH_PUBLIC_KEY="$SSH_PUBLIC_KEY_INPUT"
           fi
           if [ -z "$SSH_PUBLIC_KEY" ]; then
             echo "SSH public key is required"
+            exit 1
+          fi
+          if ! printf '%s\n' "$SSH_PUBLIC_KEY" | grep -Eq '^ssh-(ed25519|rsa) [A-Za-z0-9+/=]+([[:space:]].*)?$'; then
+            echo "SSH public key has an invalid format"
             exit 1
           fi
           printf '%s\n' "$SSH_PUBLIC_KEY" | sudo tee /home/proxyuser/.ssh/authorized_keys >/dev/null
@@ -45,16 +56,25 @@ jobs:
           sudo chmod 700 /home/proxyuser/.ssh
           sudo chmod 600 /home/proxyuser/.ssh/authorized_keys
           sudo passwd -l proxyuser || true
-          sudo sed -i 's/^#\?PasswordAuthentication .*/PasswordAuthentication no/' /etc/ssh/sshd_config
-          sudo sed -i 's/^#\?PubkeyAuthentication .*/PubkeyAuthentication yes/' /etc/ssh/sshd_config
+          sudo tee /etc/ssh/sshd_config.d/99-cloudflare-proxy.conf >/dev/null <<'EOF'
+          PasswordAuthentication no
+          KbdInteractiveAuthentication no
+          PubkeyAuthentication yes
+          AllowTcpForwarding yes
+          GatewayPorts no
+          X11Forwarding no
+          AllowAgentForwarding no
+          EOF
           sudo /usr/sbin/sshd -t
           sudo /usr/sbin/sshd
+          sudo cat /etc/ssh/ssh_host_ed25519_key.pub > ssh_host_key.pub
 
       - name: Start Cloudflare quick tunnel
         shell: bash
         run: |
           set -euo pipefail
-          nohup cloudflared tunnel --url ssh://localhost:22 --no-autoupdate > cloudflared.log 2>&1 &
+          nohup env RUNNER_TRACKING_ID="" cloudflared tunnel --url ssh://localhost:22 --no-autoupdate > cloudflared.log 2>&1 &
+          echo $! > cloudflared.pid
           mkdir -p tunnel-info
           TUNNEL_URL=""
           for i in {1..60}; do
@@ -71,15 +91,24 @@ jobs:
           TUNNEL_HOST="${TUNNEL_URL#https://}"
           printf '%s\n' "$TUNNEL_HOST" > tunnel-info/host.txt
           printf '%s\n' "$TUNNEL_URL" > tunnel-info/url.txt
+          cp ssh_host_key.pub tunnel-info/ssh_host_key.pub
           printf 'Cloudflare tunnel: %s\n' "$TUNNEL_URL"
           cat cloudflared.log
 
       - name: Upload tunnel info
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02
         with:
           name: tunnel-info
           path: tunnel-info/
 
       - name: Keep proxy alive
         shell: bash
-        run: sleep 21600
+        run: |
+          set -euo pipefail
+          CLOUDFLARED_PID="$(cat cloudflared.pid)"
+          while kill -0 "$CLOUDFLARED_PID" 2>/dev/null && sudo pgrep -x sshd >/dev/null; do
+            sleep 10
+          done
+          echo "cloudflared or sshd exited unexpectedly"
+          tail -n 200 cloudflared.log || true
+          exit 1
