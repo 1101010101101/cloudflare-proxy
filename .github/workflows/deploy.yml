@@ -1,4 +1,4 @@
-# cloudflare-proxy-managed-version: 3
+# cloudflare-proxy-managed-version: 5
 name: Cloudflare Tunnel Proxy
 
 on:
@@ -21,7 +21,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL -o /tmp/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          CLOUDFLARED_VERSION="2026.7.1"
+          CLOUDFLARED_SHA256="79a0ade7fc854f62c1aaef48424d9d979e8c2fcd039189d24db82b84cd146be1"
+          curl -fsSL -o /tmp/cloudflared "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64"
+          printf '%s  %s\n' "$CLOUDFLARED_SHA256" /tmp/cloudflared | sha256sum --check --strict
           sudo install -m 0755 /tmp/cloudflared /usr/local/bin/cloudflared
           cloudflared --version
 
@@ -47,7 +50,7 @@ jobs:
             echo "SSH public key is required"
             exit 1
           fi
-          if ! printf '%s\n' "$SSH_PUBLIC_KEY" | grep -Eq '^ssh-(ed25519|rsa) [A-Za-z0-9+/=]+([[:space:]].*)?$'; then
+          if ! printf '%s\n' "$SSH_PUBLIC_KEY" | grep -Eq '^ssh-rsa [A-Za-z0-9+/=]+([[:space:]].*)?$'; then
             echo "SSH public key has an invalid format"
             exit 1
           fi
@@ -67,7 +70,7 @@ jobs:
           EOF
           sudo /usr/sbin/sshd -t
           sudo /usr/sbin/sshd
-          sudo cat /etc/ssh/ssh_host_ed25519_key.pub > ssh_host_key.pub
+          sudo cat /etc/ssh/ssh_host_rsa_key.pub > ssh_host_key.pub
 
       - name: Start Cloudflare quick tunnel
         shell: bash
