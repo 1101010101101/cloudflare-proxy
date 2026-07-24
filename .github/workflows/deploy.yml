@@ -1,4 +1,4 @@
-# cloudflare-proxy-managed-version: 3
+# cloudflare-proxy-managed-version: 7
 name: Cloudflare Tunnel Proxy
 
 on:
@@ -21,7 +21,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          curl -fsSL -o /tmp/cloudflared https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64
+          CLOUDFLARED_VERSION="2026.7.1"
+          CLOUDFLARED_SHA256="79a0ade7fc854f62c1aaef48424d9d979e8c2fcd039189d24db82b84cd146be1"
+          curl -fsSL -o /tmp/cloudflared "https://github.com/cloudflare/cloudflared/releases/download/${CLOUDFLARED_VERSION}/cloudflared-linux-amd64"
+          printf '%s  %s\n' "$CLOUDFLARED_SHA256" /tmp/cloudflared | sha256sum --check --strict
           sudo install -m 0755 /tmp/cloudflared /usr/local/bin/cloudflared
           cloudflared --version
 
@@ -47,7 +50,7 @@ jobs:
             echo "SSH public key is required"
             exit 1
           fi
-          if ! printf '%s\n' "$SSH_PUBLIC_KEY" | grep -Eq '^ssh-(ed25519|rsa) [A-Za-z0-9+/=]+([[:space:]].*)?$'; then
+          if ! printf '%s\n' "$SSH_PUBLIC_KEY" | grep -Eq '^(ssh-rsa|ssh-ed25519) [A-Za-z0-9+/=]+([[:space:]].*)?$'; then
             echo "SSH public key has an invalid format"
             exit 1
           fi
@@ -64,17 +67,37 @@ jobs:
           GatewayPorts no
           X11Forwarding no
           AllowAgentForwarding no
+          HostKeyAlgorithms +ssh-rsa,ssh-ed25519
+          PubkeyAcceptedAlgorithms +ssh-rsa,ssh-ed25519
           EOF
           sudo /usr/sbin/sshd -t
           sudo /usr/sbin/sshd
-          sudo cat /etc/ssh/ssh_host_ed25519_key.pub > ssh_host_key.pub
+          # Newer Ubuntu runner images no longer generate an RSA host key. Pick
+          # Ed25519 (preferred) or RSA if present, otherwise generate a fresh
+          # Ed25519 host key so the app always receives a pin we can verify.
+          if [ -f /etc/ssh/ssh_host_ed25519_key.pub ]; then
+            sudo cat /etc/ssh/ssh_host_ed25519_key.pub > ssh_host_key.pub
+          elif [ -f /etc/ssh/ssh_host_rsa_key.pub ]; then
+            sudo cat /etc/ssh/ssh_host_rsa_key.pub > ssh_host_key.pub
+          else
+            sudo ssh-keygen -t ed25519 -N '' -f /tmp/ssh_host_ed25519_key >/dev/null
+            sudo /usr/sbin/sshd -t && sudo pkill -x sshd || true
+            sudo install -m 0600 /tmp/ssh_host_ed25519_key /etc/ssh/ssh_host_ed25519_key
+            sudo install -m 0644 /tmp/ssh_host_ed25519_key.pub /etc/ssh/ssh_host_ed25519_key.pub
+            sudo /usr/sbin/sshd
+            cat /tmp/ssh_host_ed25519_key.pub > ssh_host_key.pub
+          fi
 
       - name: Start Cloudflare quick tunnel
         shell: bash
         run: |
           set -euo pipefail
-          nohup cloudflared tunnel --url ssh://localhost:22 --no-autoupdate > cloudflared.log 2>&1 &
-          echo $! > cloudflared.pid
+          : > cloudflared.log
+          chmod 0666 cloudflared.log
+          sudo systemd-run --unit=cloudflare-proxy --collect --service-type=exec \
+            --property="StandardOutput=append:$GITHUB_WORKSPACE/cloudflared.log" \
+            --property="StandardError=append:$GITHUB_WORKSPACE/cloudflared.log" \
+            /usr/local/bin/cloudflared tunnel --url ssh://localhost:22 --no-autoupdate
           mkdir -p tunnel-info
           TUNNEL_URL=""
           for i in {1..60}; do
@@ -82,13 +105,40 @@ jobs:
             if [ -n "$TUNNEL_URL" ]; then
               break
             fi
+            if ! systemctl is-active --quiet cloudflare-proxy.service; then
+              break
+            fi
             sleep 2
           done
           if [ -z "$TUNNEL_URL" ]; then
             cat cloudflared.log
+            systemctl status cloudflare-proxy.service --no-pager || true
             exit 1
           fi
           TUNNEL_HOST="${TUNNEL_URL#https://}"
+          TUNNEL_READY=0
+          for i in {1..30}; do
+            STATUS_LINE="$(curl --http1.1 --silent --include --no-buffer --max-time 5 \
+              -H 'Connection: Upgrade' \
+              -H 'Upgrade: websocket' \
+              -H 'Sec-WebSocket-Version: 13' \
+              -H 'Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==' \
+              "https://$TUNNEL_HOST/" 2>/dev/null | head -n 1 | tr -d '\r' || true)"
+            if printf '%s\n' "$STATUS_LINE" | grep -Eq '^HTTP/1\.[01] 101([[:space:]]|$)'; then
+              TUNNEL_READY=1
+              break
+            fi
+            if ! systemctl is-active --quiet cloudflare-proxy.service; then
+              break
+            fi
+            sleep 2
+          done
+          if [ "$TUNNEL_READY" -ne 1 ]; then
+            echo "Cloudflare tunnel never passed the WebSocket health check"
+            cat cloudflared.log
+            systemctl status cloudflare-proxy.service --no-pager || true
+            exit 1
+          fi
           printf '%s\n' "$TUNNEL_HOST" > tunnel-info/host.txt
           printf '%s\n' "$TUNNEL_URL" > tunnel-info/url.txt
           cp ssh_host_key.pub tunnel-info/ssh_host_key.pub
@@ -105,9 +155,10 @@ jobs:
         shell: bash
         run: |
           set -euo pipefail
-          while pgrep -f 'cloudflared tunnel --url ssh://localhost:22' >/dev/null && timeout 2 bash -c '</dev/tcp/127.0.0.1/22' 2>/dev/null; do
+          while systemctl is-active --quiet cloudflare-proxy.service && timeout 2 bash -c '</dev/tcp/127.0.0.1/22' 2>/dev/null; do
             sleep 10
           done
           echo "cloudflared or sshd exited unexpectedly"
+          systemctl status cloudflare-proxy.service --no-pager || true
           tail -n 200 cloudflared.log || true
           exit 1
